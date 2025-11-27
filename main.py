@@ -1,81 +1,84 @@
+import os
+import sys
+import time
+import traceback
+import json
+import urllib.request
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from torch.utils.data import Dataset, DataLoader
-import json
-import tiktoken
-import os
-import urllib.request
-import time
 
 # ==========================================
-# 1. КОНФИГУРАЦИЯ
+# 0. НАСТРОЙКИ СРЕДЫ (FIX ДЛЯ AMD WINDOWS)
 # ==========================================
-# Увеличим параметры, так как теперь мы серьезны
-BATCH_SIZE = 8       # Если вылетает ошибка памяти (OOM), уменьшите до 4 или 2
-BLOCK_SIZE = 128     # Длина контекста
+# Это предотвращает "тихие вылеты" на картах RX 6xxx/7xxx
+os.environ['HSA_OVERRIDE_GFX_VERSION'] = '10.3.0'
+os.environ['MIOPEN_DEBUG_COMPILE_ONLY'] = '0'
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1' # Для подробного вывода ошибок
+
+try:
+    import tiktoken
+except ImportError:
+    print("❌ Ошибка: Не установлен модуль tiktoken.")
+    print("👉 Выполните: pip install tiktoken")
+    input("Нажмите Enter для выхода...")
+    sys.exit()
+
+# ==========================================
+# 1. КОНФИГУРАЦИЯ НЕЙРОСЕТИ
+# ==========================================
+# Я поставил безопасные настройки для RX 6750 XT
+BATCH_SIZE = 4       # Количество диалогов за раз
+BLOCK_SIZE = 128     # Длина памяти (контекста)
 LEARNING_RATE = 3e-4
-EMBED_DIM = 384      # Чуть больше "мозгов" (было 256)
-NUM_HEADS = 6        # 384 / 6 = 64 размер головы
-NUM_LAYERS = 6       # Больше слоев для глубины
+EMBED_DIM = 384      # Размерность скрытого слоя
+NUM_HEADS = 6        # ВАЖНО: 384 / 6 = 64. (Должно делиться нацело!)
+NUM_LAYERS = 6       # Количество слоев (глубина)
 DROPOUT = 0.1
-EPOCHS = 3           # Пройдем по всему датасету 3 раза
+EPOCHS = 3           # Сколько раз прогнать весь датасет
+MODEL_PATH = "my_full_gpt.pt"
+DATA_FILE = "alpaca_data.json"
 
-# Название файла для сохранения модели
-MODEL_PATH = "my_alpaca_gpt.pt"
-
-# --- ЛОГИКА ВЫБОРА УСТРОЙСТВА (CUDA / ROCm / MPS / CPU) ---
+# ==========================================
+# 2. ОПРЕДЕЛЕНИЕ УСТРОЙСТВА
+# ==========================================
 def get_device():
-    # 1. Проверяем CUDA (NVIDIA) или ROCm (AMD)
-    # PyTorch для ROCm использует интерфейс 'cuda', поэтому is_available() вернет True
     if torch.cuda.is_available():
-        # Проверим, это AMD или Nvidia
-        if torch.version.hip:
-            print(f"✅ Устройство: AMD GPU (ROCm) | {torch.cuda.get_device_name(0)}")
-        else:
-            print(f"✅ Устройство: NVIDIA GPU (CUDA) | {torch.cuda.get_device_name(0)}")
+        # На Windows ROCm представляется как CUDA
+        print(f"✅ Устройство: GPU ({torch.cuda.get_device_name(0)})")
         return 'cuda'
-    
-    # 2. Проверяем Apple Metal (Mac M1/M2/M3)
     elif torch.backends.mps.is_available():
-        print("✅ Устройство: Apple Silicon (MPS/Metal)")
+        print("✅ Устройство: Apple Silicon (MPS)")
         return 'mps'
-    
-    # 3. Fallback на процессор
     else:
-        print("⚠️ Устройство: CPU (Внимание: обучение будет очень медленным)")
+        print("⚠️ Устройство: CPU (Будет медленно)")
         return 'cpu'
 
 DEVICE = get_device()
-# ---------------------------------------------------
 
 # ==========================================
-# 2. ПОДГОТОВКА ДАТАСЕТА
+# 3. ДАТАСЕТ
 # ==========================================
 class AlpacaDataset(Dataset):
     def __init__(self, json_file, tokenizer, max_length=BLOCK_SIZE):
         if not os.path.exists(json_file):
-            print("⏳ Скачиваю alpaca_data.json...")
+            print("📥 Скачиваю датасет Alpaca...")
             url = "https://raw.githubusercontent.com/tatsu-lab/stanford_alpaca/main/alpaca_data.json"
             urllib.request.urlretrieve(url, json_file)
         
-        print("⏳ Загрузка и обработка JSON...")
+        print("📂 Загрузка JSON...")
         with open(json_file, 'r', encoding='utf-8') as f:
             data = json.load(f)
         
         self.tokenizer = tokenizer
         self.samples = []
         
-        # Используем ВЕСЬ датасет (52k примеров)
-        print(f"Всего диалогов в файле: {len(data)}. Подготовка токенов...")
-        
-        for item in data:
-            # Формируем строку обучения
-            # Добавляем явный промпт для модели
+        print(f"⚙️ Обработка {len(data)} диалогов...")
+        for item in data: 
             text = f"User: {item['instruction']} {item['input']}\nBot: {item['output']}<|endoftext|>"
             self.samples.append(text)
 
-        print(f"✅ Датасет готов. Примеров: {len(self.samples)}")
         self.max_length = max_length
 
     def __len__(self):
@@ -83,23 +86,17 @@ class AlpacaDataset(Dataset):
 
     def __getitem__(self, idx):
         text = self.samples[idx]
-        # Токенизация
         tokens = self.tokenizer.encode(text, allowed_special={'<|endoftext|>'})
-        
-        # Обрезка или паддинг
         if len(tokens) > self.max_length:
             tokens = tokens[:self.max_length]
         else:
-            # 50256 - это токен <|endoftext|> в GPT-2
             tokens = tokens + [50256] * (self.max_length - len(tokens))
-            
+        
         data = torch.tensor(tokens, dtype=torch.long)
-        x = data[:-1]
-        y = data[1:]
-        return x, y
+        return data[:-1], data[1:]
 
 # ==========================================
-# 3. АРХИТЕКТУРА МОДЕЛИ (GPT)
+# 4. АРХИТЕКТУРА МОДЕЛИ (GPT)
 # ==========================================
 class Head(nn.Module):
     def __init__(self, head_size):
@@ -114,8 +111,7 @@ class Head(nn.Module):
         B, T, C = x.shape
         k = self.key(x)
         q = self.query(x)
-        # Compute attention scores
-        wei = q @ k.transpose(-2, -1) * C**-0.5
+        wei = q @ k.transpose(-2, -1) * C**-0.5 
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
         wei = F.softmax(wei, dim=-1)
         wei = self.dropout(wei)
@@ -144,9 +140,7 @@ class FeedFoward(nn.Module):
             nn.Linear(4 * n_embd, n_embd),
             nn.Dropout(DROPOUT),
         )
-
-    def forward(self, x):
-        return self.net(x)
+    def forward(self, x): return self.net(x)
 
 class Block(nn.Module):
     def __init__(self, n_embd, n_head):
@@ -173,11 +167,11 @@ class BabyGPT(nn.Module):
 
     def forward(self, idx, targets=None):
         B, T = idx.shape
-        # device=idx.device гарантирует, что эмбеддинги создаются там же, где данные (MPS/CUDA)
-        tok_emb = self.token_embedding_table(idx)
-        pos_emb = self.position_embedding_table(torch.arange(T, device=idx.device))
-        x = tok_emb + pos_emb
-        x = self.blocks(x)
+        # device=idx.device защищает от ошибок MPS/CUDA
+        tok_emb = self.token_embedding_table(idx) 
+        pos_emb = self.position_embedding_table(torch.arange(T, device=idx.device)) 
+        x = tok_emb + pos_emb 
+        x = self.blocks(x) 
         x = self.ln_f(x)
         logits = self.lm_head(x)
 
@@ -191,112 +185,124 @@ class BabyGPT(nn.Module):
         return logits, loss
 
 # ==========================================
-# 4. ЗАПУСК
+# 5. ФУНКЦИЯ ОБУЧЕНИЯ
 # ==========================================
-if __name__ == '__main__':
-    torch.manual_seed(1337)
+def train_model():
+    print("\n--- 🚀 ЗАПУСК РЕЖИМА ОБУЧЕНИЯ ---")
     
-    # 1. Токенизатор
-    print("Инициализация токенизатора...")
-    try:
-        tokenizer = tiktoken.get_encoding("gpt2")
-    except:
-        print("Ошибка: не установлен tiktoken. Выполните pip install tiktoken")
-        exit()
-    
-    # 2. Датасет и Dataloader
-    dataset = AlpacaDataset('alpaca_data.json', tokenizer)
+    # Проверка математики
+    if EMBED_DIM % NUM_HEADS != 0:
+        print(f"❌ ОШИБКА КОНФИГУРАЦИИ: EMBED_DIM ({EMBED_DIM}) не делится на NUM_HEADS ({NUM_HEADS})!")
+        return
+
+    tokenizer = tiktoken.get_encoding("gpt2")
+    dataset = AlpacaDataset(DATA_FILE, tokenizer)
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
 
-    # 3. Модель
-    print(f"Создание модели (Layers: {NUM_LAYERS}, Heads: {NUM_HEADS}, Emb: {EMBED_DIM})...")
-    model = BabyGPT(vocab_size=50304) # 50304 - стандарт GPT-2 (красиво делится)
-    
-    # Перенос модели на устройство
-    model = model.to(DEVICE)
-    
+    model = BabyGPT(vocab_size=50304).to(DEVICE)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
-    
-    num_params = sum(p.numel() for p in model.parameters())
-    print(f"🔥 Модель готова. Количество параметров: {num_params/1e6:.2f} M")
-    print(f"🚀 Начинаем обучение на {DEVICE} | Эпох: {EPOCHS}")
 
-    # --- ЦИКЛ ОБУЧЕНИЯ ---
+    print(f"🧠 Параметров модели: {sum(p.numel() for p in model.parameters())/1e6:.2f} M")
+    
     model.train()
     start_time = time.time()
-    
-    for epoch in range(EPOCHS):
-        for i, (xb, yb) in enumerate(dataloader):
-            # Перенос батча на GPU/MPS
-            xb, yb = xb.to(DEVICE), yb.to(DEVICE)
-            
-            # Forward
-            logits, loss = model(xb, yb)
-            
-            # Backward
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
-            
-            # Логирование
-            if i % 50 == 0:
-                elapsed = time.time() - start_time
-                print(f"Epoch {epoch+1}/{EPOCHS} | Step {i} | Loss: {loss.item():.4f} | Time: {elapsed:.1f}s")
-                # Можно сохранять чекпоинты каждые N шагов, если нужно
 
-    print("🏁 Обучение завершено!")
-    
-    # --- СОХРАНЕНИЕ ---
-    print(f"💾 Сохраняю веса модели в {MODEL_PATH}...")
-    torch.save(model.state_dict(), MODEL_PATH)
-
-    # ==========================================
-    # 5. ТЕСТ ГЕНЕРАЦИИ (INFERENCE)
-    # ==========================================
-    print("\n--- 🤖 ТЕСТ ЧАТ-БОТА ---")
-    model.eval()
-    
-    # Функция для чистой генерации
-    def generate_response(prompt, max_tokens=100):
-        full_prompt = f"User: {prompt}\nBot:"
-        input_ids = tokenizer.encode(full_prompt)
-        x = torch.tensor([input_ids], dtype=torch.long, device=DEVICE)
-        
-        # Список для сгенерированных токенов
-        generated = []
-        
-        with torch.no_grad():
-            for _ in range(max_tokens):
-                # Обрезаем контекст, если он стал слишком длинным
-                idx_cond = x[:, -BLOCK_SIZE:]
+    try:
+        for epoch in range(EPOCHS):
+            print(f"\n🌀 Эпоха {epoch+1}/{EPOCHS}")
+            for i, (xb, yb) in enumerate(dataloader):
+                xb, yb = xb.to(DEVICE), yb.to(DEVICE)
                 
-                # Получаем предсказание
+                logits, loss = model(xb, yb)
+                
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                optimizer.step()
+                
+                if i % 10 == 0:
+                    elapsed = time.time() - start_time
+                    print(f"\rStep {i} | Loss: {loss.item():.4f} | Time: {elapsed:.0f}s", end="")
+        
+        print("\n\n✅ Обучение завершено!")
+        print(f"💾 Сохраняю в {MODEL_PATH}...")
+        torch.save(model.state_dict(), MODEL_PATH)
+
+    except RuntimeError as e:
+        if "out of memory" in str(e).lower():
+            print("\n💀 ОШИБКА ПАМЯТИ (OOM)! Уменьшите BATCH_SIZE.")
+        else:
+            print(f"\n❌ ОШИБКА ВО ВРЕМЯ ОБУЧЕНИЯ: {e}")
+            traceback.print_exc()
+
+# ==========================================
+# 6. ФУНКЦИЯ ЧАТА
+# ==========================================
+def chat_with_bot():
+    print("\n--- 🤖 ЗАПУСК РЕЖИМА ЧАТА ---")
+    
+    if not os.path.exists(MODEL_PATH):
+        print(f"❌ Файл {MODEL_PATH} не найден! Сначала обучите модель.")
+        return
+
+    tokenizer = tiktoken.get_encoding("gpt2")
+    model = BabyGPT(vocab_size=50304).to(DEVICE)
+    
+    print("📥 Загрузка весов...")
+    try:
+        model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
+    except Exception as e:
+        print(f"❌ Ошибка загрузки модели: {e}")
+        return
+        
+    model.eval()
+    print("✅ Бот готов! (Напишите 'exit' для выхода)")
+
+    while True:
+        user_text = input("\nUser: ")
+        if user_text.lower() in ['exit', 'quit']: break
+        
+        prompt = f"User: {user_text}\nBot:"
+        idx = torch.tensor([tokenizer.encode(prompt)], dtype=torch.long, device=DEVICE)
+        
+        print("Bot: ", end="", flush=True)
+        with torch.no_grad():
+            for _ in range(100):
+                idx_cond = idx[:, -BLOCK_SIZE:]
                 logits, _ = model(idx_cond)
                 logits = logits[:, -1, :]
-                
-                # Sampling (выбор с вероятностью)
                 probs = F.softmax(logits, dim=-1)
                 idx_next = torch.multinomial(probs, num_samples=1)
-                token_id = idx_next.item()
                 
-                # Если модель решила закончить фразу (токен <|endoftext|>)
-                if token_id == 50256:
-                    break
+                token = idx_next.item()
+                if token == 50256: break # Конец текста
                 
-                generated.append(token_id)
-                # Добавляем к входу для следующего шага
-                x = torch.cat((x, idx_next), dim=1)
+                print(tokenizer.decode([token]), end="", flush=True)
+                idx = torch.cat((idx, idx_next), dim=1)
+        print()
+
+# ==========================================
+# 7. ГЛАВНОЕ МЕНЮ
+# ==========================================
+if __name__ == '__main__':
+    try:
+        print("="*40)
+        print("   MASTER AI: ROCm/MPS GPT TRAINER")
+        print("="*40)
+        print("1. 🏋️  Обучить новую модель")
+        print("2. 💬  Болтать с уже обученной")
         
-        return tokenizer.decode(generated)
-
-    # Примеры вопросов
-    questions = [
-        "Hello, how are you?",
-        "What is Python?",
-        "Tell me a story about a cat."
-    ]
-
-    for q in questions:
-        print(f"\nUser: {q}")
-        ans = generate_response(q)
-        print(f"Bot: {ans}")
+        choice = input("\nВаш выбор (1 или 2): ")
+        
+        if choice == '1':
+            train_model()
+        elif choice == '2':
+            chat_with_bot()
+        else:
+            print("Неверный выбор.")
+            
+    except Exception as e:
+        print("\n❌ ПРОИЗОШЛА НЕПРЕДВИДЕННАЯ ОШИБКА:")
+        traceback.print_exc()
+        
+    print("\nНажмите Enter, чтобы закрыть...")
+    input()
